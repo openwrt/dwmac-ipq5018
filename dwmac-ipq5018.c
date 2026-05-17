@@ -15,7 +15,7 @@
 #include <linux/reset.h>
 #include <linux/stmmac.h>
 
-#include <linux/qca_uniphy.h>
+#include <qca_uniphy.h>
 
 #include "stmmac_platform.h"
 
