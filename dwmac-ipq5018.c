@@ -1,5 +1,6 @@
 #include <linux/clk.h>
 #include <linux/of_mdio.h>
+#include <linux/pcs/pcs.h>
 #include <linux/phy/phy.h>
 #include <linux/platform_device.h>
 #include <linux/reset.h>
@@ -64,49 +65,31 @@ static void ipq5018_gmac_fix_speed(void *priv, unsigned int speed, unsigned int 
 	clk_set_rate(gmac->clks[IPQ5018_GMAC_CLK_TX].clk, rate);
 }
 
+static int ipq5018_gmac_fill_available_pcs(struct phylink_config *config,
+					   struct phylink_pcs **available_pcs,
+					   unsigned int num_available_pcs)
+{
+	struct device *dev = config->dev;
+
+	return fwnode_phylink_pcs_parse(dev_fwnode(dev), available_pcs,
+				        &num_available_pcs);
+}
+
 static int ipq5018_gmac_pcs_init(struct stmmac_priv *priv)
 {
-	struct device_node *np = priv->device->of_node;
-	struct device_node *pcs_node;
-	struct phylink_pcs *pcs;
-	struct qca_uniphy_pcs *upcs;
+	struct phylink_config *config = priv->phylink_config;
+	int ret;
 
-	pcs_node = of_parse_phandle(np, "pcs-handle", 0);
-
-	if (pcs_node) {
-		pcs = qca_uniphy_pcs_get(priv->device, pcs_node, 0);
-		of_node_put(pcs_node);
-		if (IS_ERR(pcs))
-			return PTR_ERR(pcs);
-
-		upcs = container_of(pcs, struct qca_uniphy_pcs, pcs);
-		upcs->mode = of_phy_is_fixed_link(np) ? MLO_AN_FIXED : MLO_AN_PHY;
-
-		priv->hw->phylink_pcs = pcs;
+	ret = fwnode_phylink_pcs_parse(dev_fwnode(&priv->dev->dev), NULL,
+				       &config->num_available_pcs);
+	if (ret) {
+		dev_err(&priv->dev->dev, "failed to parse PCS from fwnode\n");
+		return;
 	}
+
+	config->fill_available_pcs = ipq5018_gmac_fill_available_pcs;
 
 	return 0;
-}
-
-static void ipq5018_gmac_pcs_exit(struct stmmac_priv *priv)
-{
-	if (priv->hw->phylink_pcs)
-		qca_uniphy_pcs_put(priv->hw->phylink_pcs);
-}
-
-static struct phylink_pcs *ipq5018_gmac_select_pcs(struct stmmac_priv *priv,
-						 phy_interface_t interface)
-{
-	switch (interface) {
-	case PHY_INTERFACE_MODE_SGMII:
-	case PHY_INTERFACE_MODE_2500BASEX:
-		if (priv->hw->phylink_pcs)
-			return priv->hw->phylink_pcs;
-	default:
-		break;
-	}
-
-	return NULL;
 }
 
 static void ipq5018_gmac_get_interfaces(struct stmmac_priv *priv, void *bsp_priv,
@@ -116,6 +99,8 @@ static void ipq5018_gmac_get_interfaces(struct stmmac_priv *priv, void *bsp_priv
 
 	__set_bit(PHY_INTERFACE_MODE_SGMII, interfaces);
 	__set_bit(PHY_INTERFACE_MODE_2500BASEX, interfaces);
+
+	phy_interface_copy(config->pcs_interfaces, interfaces);
 
 	/* 
 	 * Synopsys DWMAC is IP version 3.7 is limited to 1 Gpbs.
@@ -166,8 +151,6 @@ static int ipq5018_gmac_probe(struct platform_device *pdev)
 	plat_dat->get_interfaces = ipq5018_gmac_get_interfaces;
 	plat_dat->fix_mac_speed = ipq5018_gmac_fix_speed;
 	plat_dat->pcs_init = ipq5018_gmac_pcs_init;
-	plat_dat->pcs_exit = ipq5018_gmac_pcs_exit;
-	plat_dat->select_pcs = ipq5018_gmac_select_pcs;
 
 	return stmmac_dvr_probe(dev, plat_dat, &stmmac_res);
 }
