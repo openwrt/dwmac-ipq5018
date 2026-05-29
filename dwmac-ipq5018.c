@@ -2,14 +2,12 @@
 /*
  * Qualcomm IPQ5018 DWMAC glue layer
  *
- * Copyright (C) 2026
- * Christian Marangi <ansuelsmth@gmail.com>
- * George Moussalem <george.moussalem@outlook.com>
- * Robert Marko <robimarko@gmail.com>
+ * Copyright (C) 2026 The OpenWrt Project
  */
 
 #include <linux/clk.h>
 #include <linux/of_mdio.h>
+#include <linux/pcs/pcs.h>
 #include <linux/phy/phy.h>
 #include <linux/platform_device.h>
 #include <linux/reset.h>
@@ -19,37 +17,26 @@
 
 #include "stmmac_platform.h"
 
-enum {
-	IPQ5018_GMAC_CLK_SYS,
-	IPQ5018_GMAC_CLK_CFG,
-	IPQ5018_GMAC_CLK_PTP,
-	IPQ5018_GMAC_CLK_AHB,
-	IPQ5018_GMAC_CLK_AXI,
-	IPQ5018_GMAC_CLK_RX,
-	IPQ5018_GMAC_CLK_TX,
-};
-
-static const struct clk_bulk_data ipq5018_gmac_clks[] = {
-	[IPQ5018_GMAC_CLK_SYS]	= { .id = "stmmaceth" },
-	[IPQ5018_GMAC_CLK_CFG]	= { .id = "pclk" },
-	[IPQ5018_GMAC_CLK_PTP]	= { .id = "ptp_ref" },
-	[IPQ5018_GMAC_CLK_AHB]	= { .id = "ahb" },
-	[IPQ5018_GMAC_CLK_AXI]	= { .id = "axi" },
-	[IPQ5018_GMAC_CLK_RX]	= { .id = "rx" },
-	[IPQ5018_GMAC_CLK_TX]	= { .id = "tx" },
+static struct clk_bulk_data ipq5018_gmac_clks[] = {
+	{ .id = "stmmaceth" },
+	{ .id = "pclk" },
+	{ .id = "ptp_ref" },
+	{ .id = "ahb" },
+	{ .id = "axi" },
+	{ .id = "rx" },
+	{ .id = "tx" },
 };
 
 struct ipq5018_gmac {
 	struct device *dev;
-	struct clk_bulk_data clks[ARRAY_SIZE(ipq5018_gmac_clks)];
+	struct clk *rx_clk;
+	struct clk *tx_clk;
 };
 
 static void ipq5018_gmac_fix_speed(void *priv, unsigned int speed, unsigned int mode)
 {
 	struct ipq5018_gmac *gmac = priv;
 	unsigned long rate;
-
-	dev_info(gmac->dev, "%s: speed=%u, mode=0x%x\n", __func__, speed, mode);
 
 	switch(speed) {
 		case SPEED_10:
@@ -70,42 +57,39 @@ static void ipq5018_gmac_fix_speed(void *priv, unsigned int speed, unsigned int 
 			break;
 	}
 
-	clk_set_rate(gmac->clks[IPQ5018_GMAC_CLK_RX].clk, rate);
-	clk_set_rate(gmac->clks[IPQ5018_GMAC_CLK_TX].clk, rate);
+	clk_set_rate(gmac->rx_clk, rate);
+	clk_set_rate(gmac->tx_clk, rate);
 }
 
 static int ipq5018_gmac_pcs_init(struct stmmac_priv *priv)
 {
-	struct device_node *np = priv->device->of_node;
-	struct device_node *pcs_node;
-	struct phylink_pcs *pcs;
 	struct qca_uniphy_pcs *upcs;
+	struct phylink_pcs *pcs;
+	int ret;
 
-	pcs_node = of_parse_phandle(np, "pcs-handle", 0);
-
-	if (pcs_node) {
-		pcs = qca_uniphy_pcs_get(priv->device, pcs_node, 0);
-		of_node_put(pcs_node);
-		if (IS_ERR(pcs))
-			return PTR_ERR(pcs);
-
-		upcs = container_of(pcs, struct qca_uniphy_pcs, pcs);
-		upcs->mode = of_phy_is_fixed_link(np) ? MLO_AN_FIXED : MLO_AN_PHY;
-
-		priv->hw->phylink_pcs = pcs;
+	pcs = fwnode_pcs_get(dev_fwnode(priv->device), 0);
+	if (!pcs)
+		return 0;
+	else if (IS_ERR(pcs)) {
+		ret = PTR_ERR(pcs);
+		if (ret == -ENOENT)
+			return 0;
+		dev_err(priv->device, "failed to parse PCS from fwnode\n");
+		return ret;
 	}
+
+	priv->hw->phylink_pcs = pcs;
+
+	// config->fill_available_pcs = ipq5018_gmac_fill_available_pcs;
+
+	upcs = to_qca_uniphy_pcs(pcs);
+	upcs->force_mode = of_phy_is_fixed_link(priv->device->of_node);
 
 	return 0;
 }
 
-static void ipq5018_gmac_pcs_exit(struct stmmac_priv *priv)
-{
-	if (priv->hw->phylink_pcs)
-		qca_uniphy_pcs_put(priv->hw->phylink_pcs);
-}
-
 static struct phylink_pcs *ipq5018_gmac_select_pcs(struct stmmac_priv *priv,
-						 phy_interface_t interface)
+						   phy_interface_t interface)
 {
 	switch (interface) {
 	case PHY_INTERFACE_MODE_SGMII:
@@ -124,15 +108,22 @@ static void ipq5018_gmac_get_interfaces(struct stmmac_priv *priv, void *bsp_priv
 {
 	struct mac_device_info *mac = priv->hw;
 
-	__set_bit(PHY_INTERFACE_MODE_SGMII, interfaces);
-	__set_bit(PHY_INTERFACE_MODE_2500BASEX, interfaces);
-
-	/* 
-	 * Synopsys DWMAC is IP version 3.7 is limited to 1 Gpbs.
-	 * This vendor specific implementation supports 2.5 Gbps, so override
-	 * the default mac link capabilities.
+	/*
+	 * IPQ5018 has two GMACs:
+	 * - GMAC0 supports SGMII and is wired to the SoC's internal GE PHY
+	 * - GMAC1 supports SGMII and 2500BaseX, configurable by the UNIPHY PCS
 	 */
-	mac->link.caps |= MAC_2500FD;
+	__set_bit(PHY_INTERFACE_MODE_SGMII, interfaces);
+	if (priv->hw->phylink_pcs) {
+		__set_bit(PHY_INTERFACE_MODE_2500BASEX, interfaces);
+
+		/* 
+		 * Synopsys DWMAC IP version 3.7 is limited to 1 Gpbs.
+		 * This vendor specific implementation supports 2.5 Gbps, so override
+	 	 * the default mac link capabilities.
+	 	 */
+		mac->link.caps |= MAC_2500FD;	
+	}
 }
 
 static int ipq5018_gmac_probe(struct platform_device *pdev)
@@ -160,23 +151,31 @@ static int ipq5018_gmac_probe(struct platform_device *pdev)
 
 	gmac->dev = dev;
 
-	memcpy(gmac->clks, ipq5018_gmac_clks, sizeof(gmac->clks));
-	ret = devm_clk_bulk_get_optional(dev, ARRAY_SIZE(gmac->clks), gmac->clks);
-	if (ret)
-		return dev_err_probe(dev, ret,
-				     "failed to acquire clocks\n");
+	gmac->rx_clk = devm_clk_get(dev, "rx");
+	if (IS_ERR(gmac->rx_clk))
+		return dev_err_probe(dev, PTR_ERR(gmac->rx_clk),
+				     "failed to get RX clock\n");
 
-	ret = clk_bulk_prepare_enable(ARRAY_SIZE(gmac->clks), gmac->clks);
+	gmac->tx_clk = devm_clk_get(dev, "tx");
+	if (IS_ERR(gmac->tx_clk))
+		return dev_err_probe(dev, PTR_ERR(gmac->tx_clk),
+				     "failed to get TX clock\n");
+	
+	ret = devm_clk_bulk_get(dev, ARRAY_SIZE(ipq5018_gmac_clks),
+				ipq5018_gmac_clks);
 	if (ret)
-		return dev_err_probe(dev, ret,
-				     "failed to enable clocks\n");
+		return dev_err_probe(dev, ret, "failed to get clocks\n");
+
+	ret = clk_bulk_prepare_enable(ARRAY_SIZE(ipq5018_gmac_clks),
+						 ipq5018_gmac_clks);
+	if (ret)
+		return dev_err_probe(dev, ret, "failed to enable clocks\n");
 
 	plat_dat->bsp_priv = gmac;
 	plat_dat->max_speed = 2500;
 	plat_dat->get_interfaces = ipq5018_gmac_get_interfaces;
 	plat_dat->fix_mac_speed = ipq5018_gmac_fix_speed;
 	plat_dat->pcs_init = ipq5018_gmac_pcs_init;
-	plat_dat->pcs_exit = ipq5018_gmac_pcs_exit;
 	plat_dat->select_pcs = ipq5018_gmac_select_pcs;
 
 	return stmmac_dvr_probe(dev, plat_dat, &stmmac_res);
@@ -197,8 +196,5 @@ static struct platform_driver ipq5018_gmac_dwmac_driver = {
 };
 module_platform_driver(ipq5018_gmac_dwmac_driver);
 
-MODULE_DESCRIPTION("Qualcomm IPQ5018 DWMAC driver");
-MODULE_AUTHOR("Christian Marangi <ansuelsmth@gmail.com>");
-MODULE_AUTHOR("George Moussalem <george.moussalem@outlook.com>");
-MODULE_AUTHOR("Robert Marko <robimarko@gmail.com>");
+MODULE_DESCRIPTION("Qualcomm IPQ5018 DWMAC glue layer");
 MODULE_LICENSE("GPL");
