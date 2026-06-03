@@ -17,6 +17,10 @@
 
 #include "stmmac_platform.h"
 
+#define MAX_FRAME_SIZE	16383	/* 14 bits */
+/* MAX_MTU = (MAX_FRAME_SIZE - ETH_HLEN - ETH_FCS_LEN - (2 * VLAN_HLEN)) */
+#define MAX_MTU		16357
+
 static struct clk_bulk_data ipq5018_gmac_clks[] = {
 	{ .id = "stmmaceth" },
 	{ .id = "pclk" },
@@ -79,8 +83,6 @@ static int ipq5018_gmac_pcs_init(struct stmmac_priv *priv)
 	}
 
 	priv->hw->phylink_pcs = pcs;
-
-	// config->fill_available_pcs = ipq5018_gmac_fill_available_pcs;
 
 	upcs = to_qca_uniphy_pcs(pcs);
 	upcs->force_mode = of_phy_is_fixed_link(priv->device->of_node);
@@ -173,6 +175,9 @@ static int ipq5018_gmac_probe(struct platform_device *pdev)
 
 	plat_dat->bsp_priv = gmac;
 	plat_dat->max_speed = 2500;
+	plat_dat->maxmtu = MAX_MTU;
+	plat_dat->rx_fifo_size = MAX_FRAME_SIZE;
+	plat_dat->tx_fifo_size = MAX_FRAME_SIZE;
 	plat_dat->get_interfaces = ipq5018_gmac_get_interfaces;
 	plat_dat->fix_mac_speed = ipq5018_gmac_fix_speed;
 	plat_dat->pcs_init = ipq5018_gmac_pcs_init;
