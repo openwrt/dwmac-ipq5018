@@ -13,8 +13,6 @@
 #include <linux/reset.h>
 #include <linux/stmmac.h>
 
-#include <qca_uniphy.h>
-
 #include "stmmac_platform.h"
 
 #define MAX_FRAME_SIZE	16383	/* 14 bits */
@@ -67,7 +65,6 @@ static void ipq5018_gmac_fix_speed(void *priv, unsigned int speed, unsigned int 
 
 static int ipq5018_gmac_pcs_init(struct stmmac_priv *priv)
 {
-	struct qca_uniphy_pcs *upcs;
 	struct phylink_pcs *pcs;
 	int ret;
 
@@ -83,9 +80,6 @@ static int ipq5018_gmac_pcs_init(struct stmmac_priv *priv)
 	}
 
 	priv->hw->phylink_pcs = pcs;
-
-	upcs = to_qca_uniphy_pcs(pcs);
-	upcs->force_mode = of_phy_is_fixed_link(priv->device->of_node);
 
 	return 0;
 }
